@@ -19,7 +19,7 @@ import logging
 import datetime
 import yaml
 import requests
-
+import socket
 """
 disable annoying urllib3 warning messages for connecting to servers with non verified certificate Doh!
 """
@@ -50,6 +50,11 @@ from .helpers import batch_fetch_properties, get_bool_env
 from .defer import parallelize, run_once_property
 
 from .__init__ import __version__
+"""
+To collect Vmware VM last backup time for p-vcs-1 vsphere
+"""
+from datetime import datetime as dt
+import time
 
 
 class VmwareCollector():
@@ -97,10 +102,11 @@ class VmwareCollector():
             'vms': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
             'vm_perf': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
             'vmguests': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
-            'snapshots': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
+            #'snapshots': ['vm_name', 'ds_name', 'host_name', 'dc_name', 'cluster_name'],
+            'snapshots': ['vm_name','dc_name', 'cluster_name'],
             'datastores': ['ds_name', 'dc_name', 'ds_cluster'],
-            'hosts': ['host_name', 'dc_name', 'cluster_name'],
-            'host_perf': ['host_name', 'dc_name', 'cluster_name'],
+            'hosts': ['host_name', 'dc_name', 'cluster_name','ip_addr'],
+            'host_perf': ['host_name', 'dc_name', 'cluster_name','ip_addr'],
         }
 
         # if tags are gonna be fetched 'tags' will be a label too
@@ -144,6 +150,18 @@ class VmwareCollector():
             'vmware_vm_template': GaugeMetricFamily(
                 'vmware_vm_template',
                 'VMWare VM Template (true / false)',
+                labels=self._labelNames['vms']),
+            'vmware_vm_storage_allocated': GaugeMetricFamily(   #added
+                'vmware_vm_storage_allocated',  #added
+                'VMWare VM Storage allocated size in bytes',  #added
+                labels=self._labelNames['vms']),   #added
+            'vmware_vm_storage_used': GaugeMetricFamily(   #added
+                'vmware_vm_storage_used',  #added
+                'VMWare VM Storage used size in bytes',  #added
+                labels=self._labelNames['vms']),   #added
+            'vmware_vm_last_backup': GaugeMetricFamily(
+                'vmware_vm_last_backup',
+                'VMWare VM last backup in UNIX time',
                 labels=self._labelNames['vms']),
         }
         metric_list['vmguests'] = {
@@ -748,6 +766,8 @@ class VmwareCollector():
                 'summary.config.memorySizeMB',
                 'runtime.maxCpuUsage',
                 'summary.config.template',
+                'summary.storage.committed',
+                'summary.storage.uncommitted',
             ])
 
         if self.collect_only['vmguests'] is True:
@@ -809,14 +829,17 @@ class VmwareCollector():
 
         labelNames = []
 
-        if metric_type in ('datastores',):
-            labelNames = yield self.datastoresCustomAttributesLabelNames
+        #if metric_type in ('datastores',):
+        #    labelNames = yield self.datastoresCustomAttributesLabelNames
 
-        if metric_type in ('vms', 'vm_perf', 'snapshots', 'vmguests'):
+        if metric_type in ('vms'):
             labelNames = yield self.vmsCustomAttributesLabelNames
 
-        if metric_type in ('hosts', 'host_perf'):
-            labelNames = yield self.hostsCustomAttributesLabelNames
+        #if metric_type in ('vms', 'vm_perf', 'snapshots', 'vmguests'):
+        #    labelNames = yield self.vmsCustomAttributesLabelNames
+
+        #if metric_type in ('hosts', 'host_perf'):
+        #    labelNames = yield self.hostsCustomAttributesLabelNames
 
         return labelNames
 
@@ -1028,7 +1051,7 @@ class VmwareCollector():
                 inventory[node._moId] = [
                     node.summary.config.name.rstrip('.'),
                     dc,
-                    folder.name if isinstance(folder, vim.ClusterComputeResource) else ''
+                    folder.name if isinstance(folder, vim.ClusterComputeResource) else '',
                 ]
             else:
                 logging.debug("[?         ] {level} {node}".format(level=('-' * level).ljust(7), node=node))
@@ -1584,6 +1607,12 @@ class VmwareCollector():
             if 'summary.config.template' in row:
                 metrics['vmware_vm_template'].add_metric(labels, row['summary.config.template'])
 
+            if 'summary.storage.uncommitted' and 'summary.storage.committed' in row:
+                metrics['vmware_vm_storage_allocated'].add_metric(labels, row['summary.storage.uncommitted'] + row['summary.storage.committed'] )
+
+            if 'summary.storage.committed' in row:
+                metrics['vmware_vm_storage_used'].add_metric(labels, row['summary.storage.committed'])
+
             if 'guest.disk' in row and len(row['guest.disk']) > 0:
                 for disk in row['guest.disk']:
                     metrics['vmware_vm_guest_disk_free'].add_metric(
@@ -1592,6 +1621,32 @@ class VmwareCollector():
                     metrics['vmware_vm_guest_disk_capacity'].add_metric(
                         labels + [disk.diskPath], disk.capacity
                     )
+            # Collect vm backup time in unixtime inly for custom.example.com vsphere
+            if self.host == "custom.example.com":
+                # delete custom labels
+                last_backup_label = [i for i in vm_labels[moid] if i not in customLabels]
+                if 'summary.customValue' in row:
+                    try:
+                    # Transform "Last Backup" custom attribute to UNIX time
+                        unixtime = str()
+                        if 'Time' in row['summary.customValue']['Last Backup']:
+                            first_strdate = re.findall("Time: \[(.*?)\]", row['summary.customValue']['Last Backup'])[0]
+                            first_date=dt.strptime(first_strdate, '%d.%m.%Y %H:%M:%S')
+                            unixtime = time.mktime(first_date.timetuple())
+                        elif row['summary.customValue']['Last Backup'].endswith('PM'):
+                            first_date=dt.strptime(row['summary.customValue']['Last Backup'], '%m/%d/%Y %I:%M:%S %p')
+                            unixtime = time.mktime(first_date.timetuple())
+                        elif row['summary.customValue']['Last Backup'].endswith('AM'):
+                            first_date=dt.strptime(row['summary.customValue']['Last Backup'], '%d/%m/%Y %H:%M:%S %p')
+                            unixtime = time.mktime(first_date.timetuple())
+                        elif row['summary.customValue']['Last Backup'] == '' or row['summary.customValue']['Last Backup'] == 'n/a':
+                            unixtime = '0'
+                        else:
+                            first_date=dt.strptime(row['summary.customValue']['Last Backup'], '%d.%m.%Y %H:%M:%S')
+                            unixtime = time.mktime(first_date.timetuple())
+                        metrics['vmware_vm_last_backup'].add_metric(last_backup_label, int(unixtime))
+                    except ValueError:
+                        continue    
 
             if 'guest.toolsStatus' in row:
                 metrics['vmware_vm_guest_tools_running_status'].add_metric(
@@ -1626,6 +1681,10 @@ class VmwareCollector():
 
     @defer.inlineCallbacks
     def _vmware_get_hosts(self, host_metrics):
+        def resolv2ip(dns_name):
+            ip = socket.gethostbyname_ex(dns_name)[2][0]
+            ip = ".".join(ip.split('.')[:3])
+            return ip
         """
         Get Host (ESXi) information
         """
@@ -1654,7 +1713,7 @@ class VmwareCollector():
         for host_id, host in results.items():
             try:
                 labels = host_labels[host_id]
-
+                labels.insert(3,resolv2ip(labels[0]))
                 if self.fetch_tags:
                     tags = host_tags.get(host_id, [])
                     tags = ','.join(tags)
